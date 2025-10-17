@@ -1,0 +1,325 @@
+"""
+Streamlit frontend (app.py) for StudyMate — an academic PDF conversational assistant.
+
+Features implemented in this single-file frontend:
+- Upload multiple PDFs and extract / chunk text using PyMuPDF (fitz)
+- Generate embeddings using SentenceTransformers
+- Build and query a FAISS index for semantic retrieval
+- Generate grounded answers using an LLM backend via either:
+    * Hugging Face Inference API (recommended for community models)
+    * IBM watsonx / custom REST endpoint (enter your endpoint & apikey)
+- Sidebar controls for model selection, API keys, and retrieval parameters
+- Results show the generated answer plus the top retrieved source snippets
+
+Notes / TODOs for production:
+- Move heavy work (embedding model, FAISS) to a background worker or an API for scale.
+- Persist indexes per user/session if re-querying the same documents often.
+- Use robust error handling and rate-limit LLM calls.
+
+Placeholders: you must provide your own HF_API_KEY or IBM endpoint + API key if you choose those backends.
+"""
+
+import streamlit as st
+import fitz  # PyMuPDF
+import tempfile
+import os
+import re
+from typing import List, Tuple
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+import requests
+import json
+
+# --------------------------- Utility functions ---------------------------
+
+def extract_text_from_pdf(file_path: str) -> str:
+    """Extracts text from a PDF using PyMuPDF (fitz)."""
+    doc = fitz.open(file_path)
+    text_chunks = []
+    for page in doc:
+        text = page.get_text("text")
+        if text:
+            text_chunks.append(text)
+    doc.close()
+    return "\n".join(text_chunks)
+
+
+def clean_text(t: str) -> str:
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def chunk_text(text: str, chunk_size: int = 800, overlap: int = 150) -> List[str]:
+    """Simple sliding window chunking by characters (keeps sentence boundaries approximately)."""
+    sentences = re.split(r'(?<=[\\.!?])\\s+', text)
+    chunks = []
+    cur = []
+    cur_len = 0
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if cur_len + len(s) + 1 > chunk_size and cur:
+            chunks.append(' '.join(cur))
+            # start new
+            # keep overlap by carrying last few sentences
+            if overlap > 0:
+                carry = []
+                carry_len = 0
+                # pop from cur until carry_len >= overlap or cur empty
+                while cur and carry_len < overlap:
+                    sent = cur.pop()
+                    carry.insert(0, sent)
+                    carry_len += len(sent) + 1
+                cur = carry
+                cur_len = sum(len(x) + 1 for x in cur)
+            else:
+                cur = []
+                cur_len = 0
+        cur.append(s)
+        cur_len += len(s) + 1
+    if cur:
+        chunks.append(' '.join(cur))
+    return [clean_text(c) for c in chunks if len(c.strip()) > 50]
+
+# --------------------------- Embedding & FAISS ---------------------------
+
+@st.cache_resource
+def load_embedding_model(model_name: str = 'sentence-transformers/all-MiniLM-L6-v2') -> SentenceTransformer:
+    return SentenceTransformer(model_name)
+
+
+def embed_texts(model: SentenceTransformer, texts: List[str]) -> np.ndarray:
+    vectors = model.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    # normalize
+    faiss.normalize_L2(vectors)
+    return vectors
+
+
+def build_faiss_index(vectors: np.ndarray) -> faiss.Index:
+    d = vectors.shape[1]
+    index = faiss.IndexFlatIP(d)  # inner product after L2-normalized => cosine sim
+    index.add(vectors)
+    return index
+
+
+def retrieve(index: faiss.Index, query_vec: np.ndarray, top_k: int = 5) -> Tuple[np.ndarray, np.ndarray]:
+    faiss.normalize_L2(query_vec)
+    D, I = index.search(query_vec, top_k)
+    return D, I
+
+# --------------------------- LLM Backends ---------------------------
+
+
+def call_huggingface_inference(model_id: str, prompt: str, hf_api_key: str, max_tokens: int = 512) -> str:
+    """Call Hugging Face Inference API text generation endpoint.
+    The user must provide a HF API key.
+    """
+    if not hf_api_key:
+        raise ValueError("Missing Hugging Face API key")
+    url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {hf_api_key}", "Content-Type": "application/json"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {
+            "max_new_tokens": max_tokens,
+            "temperature": 0.0,
+            "top_p": 0.95,
+            "repetition_penalty": 1.02,
+        },
+        "options": {"wait_for_model": True}
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=120)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HF inference failed: {resp.status_code} {resp.text}")
+    j = resp.json()
+    if isinstance(j, dict) and "error" in j:
+        raise RuntimeError(f"HF error: {j['error']}")
+    # Many models return a list of dicts with 'generated_text'
+    if isinstance(j, list) and len(j) > 0 and 'generated_text' in j[0]:
+        return j[0]['generated_text']
+    # or a dict with 'generated_text'
+    if isinstance(j, dict) and 'generated_text' in j:
+        return j['generated_text']
+    # fallback — try to parse
+    return json.dumps(j)
+
+
+def call_ibm_watsonx(endpoint_url: str, model_id: str, prompt: str, apikey: str, max_tokens: int = 512) -> str:
+    """Generic POST to an IBM watsonx 'deployments' or custom inference endpoint.
+    The exact REST API differs by deployment; this function sends JSON with model + prompt.
+    You must provide the correct endpoint_url (fully qualified) and apikey.
+    """
+    if not apikey or not endpoint_url:
+        raise ValueError("Missing IBM watsonx endpoint or apikey")
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {apikey}"}
+    payload = {
+        "model": model_id,
+        "input": prompt,
+        "parameters": {"max_tokens": max_tokens, "temperature": 0.0}
+    }
+    resp = requests.post(endpoint_url, headers=headers, json=payload, timeout=120)
+    if resp.status_code != 200:
+        raise RuntimeError(f"IBM watsonx call failed: {resp.status_code} {resp.text}")
+    j = resp.json()
+    # response shape may vary; try common fields
+    if isinstance(j, dict):
+        for key in ("output", "generated_text", "text", "answer"):
+            if key in j:
+                return j[key]
+        # nested
+        if "outputs" in j and isinstance(j['outputs'], list) and len(j['outputs'])>0:
+            return str(j['outputs'][0])
+    return json.dumps(j)
+
+# --------------------------- Prompting ---------------------------
+
+def build_prompt(question: str, top_chunks: List[Tuple[str, float]], instructions: str = None) -> str:
+    """Creates a clear, grounded prompt for the LLM using the retrieved chunks.
+    top_chunks: list of (text, score) ordered by relevance
+    """
+    system = (
+        "You are an academic assistant (StudyMate). Use the provided source excerpts to answer the user's question."
+        " If the answer cannot be found in the sources, say you don't know and offer how to find it."
+    )
+    if instructions:
+        system += "\n" + instructions
+
+    context_parts = []
+    for i, (txt, score) in enumerate(top_chunks, start=1):
+        context_parts.append(f"[SOURCE {i} | score={score:.4f}]\n{txt}\n")
+    context = "\n---\n".join(context_parts)
+
+    prompt = (
+        f"{system}\n\nCONTEXT:\n{context}\n\nUSER QUESTION:\n{question}\n\nINSTRUCTIONS:\nAnswer concisely, cite the source numbers inline like [SOURCE 1], and include a short list of the sources used at the end."
+    )
+    return prompt
+
+# --------------------------- Streamlit App ---------------------------
+
+def main():
+    st.set_page_config(page_title="StudyMate — Academic PDF Q&A", layout="wide")
+    st.title("StudyMate — Academic PDF Q&A (Streamlit)")
+
+    # Sidebar: settings
+    st.sidebar.header("Settings & Model")
+    embedding_model_name = st.sidebar.text_input("SentenceTransformers model", value="sentence-transformers/all-MiniLM-L6-v2")
+    backend = st.sidebar.selectbox("LLM Backend", options=["HuggingFace", "IBM watsonx", "Local (disabled)"], index=0)
+    hf_api_key = st.sidebar.text_input("Hugging Face API key", type="password")
+    ibm_endpoint = st.sidebar.text_input("IBM watsonx endpoint URL (full)")
+    ibm_apikey = st.sidebar.text_input("IBM watsonx API key (Bearer token)", type="password")
+    model_id = st.sidebar.text_input("LLM model id (e.g. mixtral-8x7b-instruct)", value="mixtral-8x7b-instruct")
+    top_k = st.sidebar.number_input("Top-k retrieval", min_value=1, max_value=20, value=5)
+    chunk_size = st.sidebar.number_input("Chunk size (chars)", min_value=200, max_value=4000, value=800)
+    overlap = st.sidebar.number_input("Chunk overlap (chars)", min_value=0, max_value=2000, value=150)
+    max_answer_tokens = st.sidebar.number_input("Max answer tokens", min_value=64, max_value=2048, value=512)
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("Made for coursework — upload PDFs and ask questions grounded in the text.")
+
+    # Upload PDFs
+    uploaded_files = st.file_uploader("Upload one or more PDFs", accept_multiple_files=True, type=['pdf'])
+
+    # Persistent in-session storage
+    if 'docs' not in st.session_state:
+        st.session_state['docs'] = []
+    if 'chunks' not in st.session_state:
+        st.session_state['chunks'] = []
+    if 'metas' not in st.session_state:
+        st.session_state['metas'] = []
+    if 'index' not in st.session_state:
+        st.session_state['index'] = None
+    if 'embeddings' not in st.session_state:
+        st.session_state['embeddings'] = None
+
+    if uploaded_files:
+        st.info(f"Processing {len(uploaded_files)} file(s) — this may take a moment.")
+        all_chunks = []
+        metas = []
+        for uploaded in uploaded_files:
+            # save to temp file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp:
+                tmp.write(uploaded.getbuffer())
+                tmp_path = tmp.name
+            text = extract_text_from_pdf(tmp_path)
+            os.unlink(tmp_path)
+            text = clean_text(text)
+            chs = chunk_text(text, chunk_size=chunk_size, overlap=overlap)
+            # attach metadata (filename, chunk index)
+            for i, c in enumerate(chs):
+                metas.append({"source": uploaded.name, "chunk_index": i})
+            all_chunks.extend(chs)
+        st.session_state['chunks'] = all_chunks
+        st.session_state['metas'] = metas
+        st.success(f"Extracted {len(all_chunks)} chunks from uploaded PDFs.")
+
+    if st.session_state['chunks']:
+        st.write(f"Indexed chunks: {len(st.session_state['chunks'])}")
+        # show examples
+        if st.expander("Show sample chunks"):
+            for i, c in enumerate(st.session_state['chunks'][:5]):
+                st.write(f"Chunk {i}: {c[:350]}...")
+
+        # Load embedding model
+        with st.spinner("Loading embedding model..."):
+            embed_model = load_embedding_model(embedding_model_name)
+
+        if st.button("Build / Rebuild FAISS index"):
+            with st.spinner("Embedding chunks and building FAISS index..."):
+                vectors = embed_texts(embed_model, st.session_state['chunks'])
+                index = build_faiss_index(vectors)
+                st.session_state['index'] = index
+                st.session_state['embeddings'] = vectors
+            st.success("FAISS index ready.")
+
+    # Query area
+    st.header("Ask a question")
+    question = st.text_area("Enter your question", height=120)
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if st.button("Get Answer"):
+            if not question or not st.session_state.get('index'):
+                st.error("Please upload PDFs and build the FAISS index before asking a question.")
+            else:
+                # embed question
+                q_vec = embed_model.encode([question], convert_to_numpy=True)
+                faiss.normalize_L2(q_vec)
+                D, I = st.session_state['index'].search(q_vec, top_k)
+                top_chunks = []
+                for score, idx in zip(D[0], I[0]):
+                    if idx < 0 or idx >= len(st.session_state['chunks']):
+                        continue
+                    top_chunks.append((st.session_state['chunks'][idx], float(score)))
+                # build prompt
+                prompt = build_prompt(question, top_chunks)
+
+                # call selected backend
+                try:
+                    if backend == 'HuggingFace':
+                        answer = call_huggingface_inference(model_id, prompt, hf_api_key, max_tokens=max_answer_tokens)
+                    elif backend == 'IBM watsonx':
+                        answer = call_ibm_watsonx(ibm_endpoint, model_id, prompt, ibm_apikey, max_tokens=max_answer_tokens)
+                    else:
+                        answer = "Local backend disabled in this demo. Use HuggingFace or IBM watsonx in the sidebar."
+                except Exception as e:
+                    st.error(f"LLM call failed: {e}")
+                    answer = None
+
+                if answer:
+                    st.subheader("Answer")
+                    st.markdown(answer)
+
+                    st.subheader("Retrieved sources")
+                    for i, (txt, score) in enumerate(top_chunks, start=1):
+                        meta = st.session_state['metas'][i-1] if i-1 < len(st.session_state['metas']) else {}
+                        with st.expander(f"SOURCE {i} — score={score:.4f} — {meta.get('source', '')}"):
+                            st.write(txt)
+
+    # Footer / notes
+    st.markdown("---")
+    st.caption("StudyMate demo — For research/educational use. Always verify model outputs against original sources.")
+
+
+if __name__ == '__main__':
+    main()
