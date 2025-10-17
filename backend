@@ -1,0 +1,247 @@
+"""
+StudyMate - backend app.py
+
+FastAPI backend that:
+- Accepts PDF uploads
+- Extracts text using PyMuPDF (fitz)
+- Chunks text
+- Embeds chunks using SentenceTransformers
+- Indexes with FAISS
+- Supports two LLM backends for answer generation:
+    1) IBM watsonx (via REST) - configure IBM_WATSONX_API_URL and IBM_WATSONX_API_KEY
+    2) HuggingFace Inference API - configure HF_API_TOKEN
+- Exposes endpoints: /upload (POST), /ask (POST), /health
+
+Notes:
+- Replace placeholders with real API endpoints & keys.
+- For production, secure file handling and authentication is required.
+
+Requirements (pip):
+fastapi uvicorn python-multipart pymupdf sentence-transformers faiss-cpu numpy pydantic requests python-dotenv
+
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+import fitz  # PyMuPDF
+import os
+import uuid
+import tempfile
+import numpy as np
+from sentence_transformers import SentenceTransformer
+import faiss
+import requests
+import json
+from typing import List, Optional
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# Configuration via env
+IBM_WATSONX_API_URL = os.getenv("IBM_WATSONX_API_URL")  # e.g. https://api.us-south.watsonx.ai/v1/generations
+IBM_WATSONX_API_KEY = os.getenv("IBM_WATSONX_API_KEY")
+HF_API_TOKEN = os.getenv("HF_API_TOKEN")  # HuggingFace Inference API token
+
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
+EMBED_DIM = 384  # for all-MiniLM-L6-v2
+CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", 800))
+CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", 150))
+TOP_K = int(os.getenv("TOP_K", 5))
+
+app = FastAPI(title="StudyMate Backend")
+
+# In-memory store for simplicity. For production, persist these.
+vector_store = {}
+index_store = {}
+meta_store = {}
+embedder = SentenceTransformer(EMBED_MODEL_NAME)
+
+class AskRequest(BaseModel):
+    session_id: str
+    question: str
+    top_k: Optional[int] = TOP_K
+
+
+def extract_text_from_pdf(file_path: str) -> str:
+    doc = fitz.open(file_path)
+    texts = []
+    for page in doc:
+        texts.append(page.get_text("text"))
+    doc.close()
+    return "\n".join(texts)
+
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> List[str]:
+    words = text.split()
+    chunks = []
+    start = 0
+    while start < len(words):
+        end = min(start + chunk_size, len(words))
+        chunk = " ".join(words[start:end])
+        chunks.append(chunk)
+        # move by chunk_size - overlap
+        if end == len(words):
+            break
+        start = end - overlap
+    return chunks
+
+
+def build_faiss_index(embeddings: np.ndarray):
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatIP(dim)  # inner-product (after normalization behaves like cosine)
+    # normalize embeddings for cosine
+    faiss.normalize_L2(embeddings)
+    index.add(embeddings)
+    return index
+
+
+def embed_texts(texts: List[str]) -> np.ndarray:
+    embs = embedder.encode(texts, show_progress_bar=False, convert_to_numpy=True)
+    # ensure float32
+    return embs.astype('float32')
+
+
+def call_ibm_watsonx(prompt: str, max_tokens: int = 512) -> str:
+    if not IBM_WATSONX_API_URL or not IBM_WATSONX_API_KEY:
+        raise RuntimeError("IBM watsonx not configured. Set IBM_WATSONX_API_URL and IBM_WATSONX_API_KEY.")
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {IBM_WATSONX_API_KEY}"
+    }
+    payload = {
+        # The exact payload depends on IBM's API. This is a flexible template — adapt to the real API.
+        "model": "mixtral-8x7b-instruct",  # example; replace with actual model id if different
+        "input": prompt,
+        "max_output_tokens": max_tokens,
+        "temperature": 0.0
+    }
+    resp = requests.post(IBM_WATSONX_API_URL, headers=headers, json=payload, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"IBM watsonx request failed: {resp.status_code} {resp.text}")
+    data = resp.json()
+    # adapt based on response structure; many APIs return generated text in data['output'] or similar
+    # try common locations
+    if isinstance(data, dict):
+        # try a few probable keys
+        for key in ("output", "results", "generations", "text", "content"):
+            if key in data:
+                v = data[key]
+                if isinstance(v, list):
+                    return v[0].get('text', str(v[0])) if len(v) > 0 else json.dumps(data)
+                if isinstance(v, dict) and 'text' in v:
+                    return v['text']
+                if isinstance(v, str):
+                    return v
+    # fallback
+    return json.dumps(data)
+
+
+def call_hf_inference(prompt: str, model: str = "google/flan-t5-large", max_new_tokens: int = 256) -> str:
+    if not HF_API_TOKEN:
+        raise RuntimeError("HuggingFace API token not configured. Set HF_API_TOKEN.")
+    hf_url = f"https://api-inference.huggingface.co/models/{model}"
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}", "Content-Type": "application/json"}
+    payload = {"inputs": prompt, "parameters": {"max_new_tokens": max_new_tokens, "temperature": 0.0}}
+    resp = requests.post(hf_url, headers=headers, json=payload, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HF inference failed: {resp.status_code} {resp.text}")
+    data = resp.json()
+    # usually returns [{'generated_text': '...'}]
+    if isinstance(data, list) and len(data) > 0 and 'generated_text' in data[0]:
+        return data[0]['generated_text']
+    if isinstance(data, dict) and 'generated_text' in data:
+        return data['generated_text']
+    # fallback
+    return json.dumps(data)
+
+
+@app.post('/upload')
+async def upload_pdf(file: UploadFile = File(...)):
+    if not file.filename.lower().endswith('.pdf'):
+        raise HTTPException(status_code=400, detail='Only PDF files are accepted')
+    # save to a temp file
+    suffix = os.path.splitext(file.filename)[1]
+    session_id = str(uuid.uuid4())
+    tmp_dir = tempfile.mkdtemp(prefix=f"studymate_{session_id}_")
+    file_path = os.path.join(tmp_dir, f"upload{suffix}")
+    with open(file_path, 'wb') as f:
+        contents = await file.read()
+        f.write(contents)
+    # extract
+    try:
+        text = extract_text_from_pdf(file_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF extraction failed: {e}")
+    # chunk
+    chunks = chunk_text(text)
+    if len(chunks) == 0:
+        raise HTTPException(status_code=400, detail="No text extracted from PDF")
+    # embed
+    embs = embed_texts(chunks)
+    # build index
+    index = build_faiss_index(embs.copy())
+    # store
+    vector_store[session_id] = embs
+    index_store[session_id] = index
+    meta_store[session_id] = {
+        "chunks": chunks,
+        "source_file": file.filename,
+        "tmp_dir": tmp_dir
+    }
+    return JSONResponse({"session_id": session_id, "chunks": len(chunks), "message": "Uploaded and indexed"})
+
+
+@app.post('/ask')
+async def ask(req: AskRequest):
+    if req.session_id not in index_store:
+        raise HTTPException(status_code=404, detail='Session not found. Upload PDFs first and use returned session_id')
+    index = index_store[req.session_id]
+    embs = vector_store[req.session_id]
+    chunks = meta_store[req.session_id]['chunks']
+
+    # embed the question
+    q_emb = embed_texts([req.question])
+    faiss.normalize_L2(q_emb)
+    D, I = index.search(q_emb, req.top_k)
+    # retrieve texts
+    retrieved = []
+    for idx in I[0]:
+        if idx < 0 or idx >= len(chunks):
+            continue
+        retrieved.append({"chunk_id": int(idx), "text": chunks[idx]})
+
+    # build prompt for LLM
+    context_text = "\n\n---\n\n".join([f"(source_chunk:{r['chunk_id']}) {r['text']}" for r in retrieved])
+    prompt = f"You are a helpful academic assistant. Answer the question using only the provided context. If the answer is not contained, say 'I don't know' and offer what steps to take.\n\nContext:\n{context_text}\n\nQuestion: {req.question}\n\nAnswer concisely and cite source_chunk ids in square brackets where applicable."
+
+    # choose backend: try IBM if configured, else HF
+    try:
+        if IBM_WATSONX_API_URL and IBM_WATSONX_API_KEY:
+            gen = call_ibm_watsonx(prompt)
+        elif HF_API_TOKEN:
+            # choose a reasonable seq2seq / text-gen model; user can change model via env
+            HF_MODEL = os.getenv('HF_MODEL', 'google/flan-t5-large')
+            gen = call_hf_inference(prompt, model=HF_MODEL)
+        else:
+            raise RuntimeError('No LLM backend configured. Set IBM or HF credentials in environment variables')
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LLM call failed: {e}")
+
+    response = {
+        "answer": gen,
+        "retrieved": retrieved,
+        "session_id": req.session_id
+    }
+    return JSONResponse(response)
+
+
+@app.get('/health')
+async def health():
+    return {"status": "ok", "index_count": len(index_store)}
+
+
+# For local debugging
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run('studymate_app:app', host='0.0.0.0', port=8000, reload=True)
